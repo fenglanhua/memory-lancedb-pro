@@ -1,8 +1,8 @@
 # `memory-lancedb-pro` 记忆架构分析
 
-> 更新时间：2026-03-06  
+> 更新时间：2026-03-09  
 > 基准：当前仓库中的 `README.md`、`openclaw.plugin.json`、`index.ts`、`src/*`、`cli.ts`  
-> 结论：当前版本已经形成完整的“写入 -> 存储 -> 检索 -> 生命周期维护 -> 运维工具”闭环；智能提取、生命周期衰减、Tier 晋升/降级、迁移升级、CLI 与 Agent Tools 都已纳入同一主架构。
+> 结论：当前版本已经形成完整的“写入 -> 存储 -> 检索 -> 生命周期维护 -> 运维工具”闭环；智能提取、嵌入噪声检测、生命周期衰减、Tier 晋升/降级、迁移升级、CLI 与 Agent Tools 都已纳入同一主架构。
 
 ---
 
@@ -16,7 +16,8 @@
 - `src/store.ts` 负责 LanceDB 表初始化、CRUD、向量检索、FTS/BM25、metadata 局部回写
 - `src/embedder.ts` 负责统一 Embedding Provider 适配、任务感知 embedding、长文本 chunking、缓存
 - `src/retriever.ts` 负责混合检索、rerank、长度归一化、生命周期重排、噪声过滤、去重多样性
-- `src/smart-extractor.ts` 负责 LLM 智能提取、两阶段去重、语义合并、新格式写入
+- `src/smart-extractor.ts` 负责 LLM 智能提取、嵌入噪声预过滤、两阶段去重、语义合并、新格式写入
+- `src/noise-prototypes.ts` 负责嵌入噪声原型库（语言无关噪声检测 + LLM 反馈学习闭环）
 - `src/decay-engine.ts` + `src/tier-manager.ts` 负责 recall 后的生命周期评分与 tier 演化
 - `src/tools.ts` 和 `cli.ts` 分别提供 Agent Tool 面与运维 CLI 面
 
@@ -59,6 +60,7 @@ graph TD
 
     subgraph WritePath["写入链路"]
         W1["agent_end"]
+        W0["NoisePrototypeBank<br/>嵌入噪声预过滤"]
         W2["SmartExtractor<br/>LLM 6 类提取"]
         W3["Regex Fallback"]
         W4["buildSmartMetadata()"]
@@ -100,7 +102,8 @@ graph TD
     X --> C
 
     P2 --> W1
-    W1 --> W2
+    W1 --> W0
+    W0 --> W2
     W1 --> W3
     W2 --> W4
     W3 --> W4
@@ -212,10 +215,13 @@ agent_end
 
 ```text
 抽取并归一化文本（默认仅 `user`；当 `captureAssistant === true` 时也包含 `assistant`）
-  -> 若 smartExtractor 可用且消息数达阈值:
-       SmartExtractor.extractAndPersist()
-       若 created > 0 或 merged > 0，则直接 return
-       否则继续走 regex fallback
+  -> 若 smartExtractor 可用:
+       嵌入噪声预过滤 filterNoiseByEmbedding(texts)
+       若所有文本被过滤 -> return（纯噪声输入）
+       若清洗后消息数 >= extractMinMessages:
+            SmartExtractor.extractAndPersist()
+            若 created > 0 或 merged > 0，则直接 return
+            否则继续走 regex fallback
   -> shouldCapture() + detectCategory() + regex fallback
   -> buildSmartMetadata()
   -> store.store()
@@ -239,12 +245,15 @@ agent_end
 `src/smart-extractor.ts` 的核心流程是：
 
 ```text
-conversationText
+texts
+  -> filterNoiseByEmbedding() 嵌入噪声预过滤
+  -> conversationText
   -> LLM 抽取 CandidateMemory[]
   -> 逐条向量预筛
   -> LLM 判定 CREATE / MERGE / SKIP
   -> buildSmartMetadata()
   -> store.store() / store.update()
+  -> 若 zero candidates -> learnAsNoise() 反馈到噪声库
 ```
 
 当前特征：
@@ -310,6 +319,32 @@ conversationText
 - 适合修正陈旧事实，而不是“删旧建新”
 
 这意味着系统现在支持“记忆更正”而不只是“记忆追加”。
+
+### 4.6 嵌入噪声检测：NoisePrototypeBank
+
+`src/noise-prototypes.ts` 提供了语言无关的噪声检测能力，替代基于正则的方式：
+
+- 内置 ~15 条多语言噪声原型（回忆查询、agent 否认、问候语）
+- 插件启动时嵌入所有原型并缓存向量（异步非阻塞）
+- auto-capture 管道中，SmartExtractor 的 `filterNoiseByEmbedding()` 在 LLM 提取前执行
+- 文本长度分层策略：<=20 字符跳过（防误判）、20-300 字符做嵌入检查、>300 字符跳过（长文本非噪声）
+- 默认相似度阈值 `0.82`
+
+**LLM 反馈闭环：**
+
+当 LLM 提取返回零候选时，`learnAsNoise()` 将该文本的嵌入向量加入噪声库：
+
+```text
+文本 -> 嵌入检查 -> [未命中] -> LLM 提取 -> 返回 {memories: []} 
+                                          |
+                              将该文本向量加入噪声库
+                                          |
+                          下次类似文本直接被嵌入检查拦截
+```
+
+- 去重：新向量与已有原型相似度 >= 0.95 则跳过
+- 容量上限：最多学习 200 条，超限淘汰最旧的学习原型（保留内置原型）
+- 仅在 `smartExtraction !== false` 时激活，不影响纯 regex 路径
 
 ---
 
@@ -775,7 +810,7 @@ README 新增的批处理方案是另一条非常值得记录的架构支线：
 | `src/embedder.ts` | Embedding 抽象层：provider 适配、task embedding、chunking、cache |
 | `src/chunker.ts` | 长文本分块器 |
 | `src/retriever.ts` | 混合检索、rerank、length norm、decay boost、MMR |
-| `src/smart-extractor.ts` | LLM 提取、两阶段去重、merge/create/skip、持久化 |
+| `src/smart-extractor.ts` | LLM 提取、嵌入噪声预过滤、两阶段去重、merge/create/skip、持久化 |
 | `src/smart-metadata.ts` | metadata 归一化、兼容映射、lifecycle 视图转换 |
 | `src/decay-engine.ts` | Weibull 衰减模型、搜索分数 boost |
 | `src/tier-manager.ts` | 三层记忆晋升/降级 |
@@ -784,7 +819,8 @@ README 新增的批处理方案是另一条非常值得记录的架构支线：
 | `cli.ts` | 运维 CLI 平面 |
 | `src/migrate.ts` | 从旧插件迁移 |
 | `src/memory-upgrader.ts` | 同库旧格式升级 |
-| `src/noise-filter.ts` | 写入/检索噪声过滤 |
+| `src/noise-filter.ts` | 写入/检索噪声过滤（regex 规则） |
+| `src/noise-prototypes.ts` | 嵌入噪声原型库：语言无关噪声检测 + LLM 反馈学习 |
 | `src/adaptive-retrieval.ts` | auto-recall 检索守卫 |
 
 ---

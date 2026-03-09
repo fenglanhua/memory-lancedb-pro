@@ -26,6 +26,7 @@ import {
   normalizeCategory,
 } from "./memory-categories.js";
 import { isNoise } from "./noise-filter.js";
+import type { NoisePrototypeBank } from "./noise-prototypes.js";
 import { buildSmartMetadata, parseSmartMetadata, stringifySmartMetadata } from "./smart-metadata.js";
 
 // ============================================================================
@@ -54,6 +55,8 @@ export interface SmartExtractorConfig {
   log?: (msg: string) => void;
   /** Debug logger function. */
   debugLog?: (msg: string) => void;
+  /** Optional embedding-based noise prototype bank for language-agnostic noise filtering. */
+  noiseBank?: NoisePrototypeBank;
 }
 
 export interface ExtractPersistOptions {
@@ -74,7 +77,7 @@ export class SmartExtractor {
     private config: SmartExtractorConfig = {},
   ) {
     this.log = config.log ?? ((msg: string) => console.log(msg));
-    this.debugLog = config.debugLog ?? (() => {});
+    this.debugLog = config.debugLog ?? (() => { });
   }
 
   // --------------------------------------------------------------------------
@@ -102,6 +105,8 @@ export class SmartExtractor {
 
     if (candidates.length === 0) {
       this.log("memory-pro: smart-extractor: no memories extracted");
+      // LLM returned zero candidates → strongest noise signal → feedback to noise bank
+      this.learnAsNoise(conversationText);
       return stats;
     }
 
@@ -127,6 +132,68 @@ export class SmartExtractor {
     }
 
     return stats;
+  }
+
+  // --------------------------------------------------------------------------
+  // Embedding Noise Pre-Filter
+  // --------------------------------------------------------------------------
+
+  /**
+   * Filter out texts that match noise prototypes by embedding similarity.
+   * Long texts (>300 chars) are passed through without checking.
+   * Only active when noiseBank is configured and initialized.
+   */
+  async filterNoiseByEmbedding(texts: string[]): Promise<string[]> {
+    const noiseBank = this.config.noiseBank;
+    if (!noiseBank || !noiseBank.initialized) return texts;
+
+    const result: string[] = [];
+    for (const text of texts) {
+      // Very short texts lack semantic signal — skip noise check to avoid false positives
+      if (text.length <= 20) {
+        result.push(text);
+        continue;
+      }
+      // Long texts are unlikely to be pure noise queries
+      if (text.length > 300) {
+        result.push(text);
+        continue;
+      }
+      try {
+        const vec = await this.embedder.embed(text);
+        if (!vec || vec.length === 0 || !noiseBank.isNoise(vec)) {
+          result.push(text);
+        } else {
+          this.debugLog(
+            `memory-lancedb-pro: smart-extractor: embedding noise filtered: ${text.slice(0, 80)}`,
+          );
+        }
+      } catch {
+        // Embedding failed — pass text through
+        result.push(text);
+      }
+    }
+    return result;
+  }
+
+  /**
+   * Feed back conversation text to the noise prototype bank.
+   * Called when LLM extraction returns zero candidates (strongest noise signal).
+   */
+  private async learnAsNoise(conversationText: string): Promise<void> {
+    const noiseBank = this.config.noiseBank;
+    if (!noiseBank || !noiseBank.initialized) return;
+
+    try {
+      const tail = conversationText.slice(-300);
+      const vec = await this.embedder.embed(tail);
+      if (vec && vec.length > 0) {
+        noiseBank.learn(vec);
+        this.debugLog("memory-lancedb-pro: smart-extractor: learned noise from zero-extraction");
+      }
+    } catch {
+      // Non-critical — silently skip
+    }
   }
 
   // --------------------------------------------------------------------------
